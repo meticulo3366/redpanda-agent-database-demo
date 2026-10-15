@@ -1,5 +1,7 @@
 # Agent memory on CockroachDB, governed by Redpanda
 
+Five-slide overview for the alliance team: https://meticulo3366.github.io/redpanda-agent-database-demo/ (source: `docs/index.html`, served by GitHub Pages from `docs/`).
+
 A bank concierge agent that remembers. Everything the **Memory Concierge** knows about a customer beyond the system-of-record tables is *memory*, and memory lives in **CockroachDB Cloud** as plain SQL rows with row-level TTL. Every memory write is captured by a CockroachDB **CHANGEFEED**, streamed through **Redpanda Cloud**, and materialised into an append-only `memory_audit` table by a **Redpanda Connect** pipeline. A second pipeline watches the `accounts` change stream and writes *observations* into memory ("account went overdrawn"), so the agent remembers what happened to the customer between conversations, not only what the customer typed. The agent runs on **Redpanda Agentic Data Plane (ADP)** with a managed SQL MCP server, an ADP guardrail evaluated by the AI Gateway (Bedrock-backed), MCP guardrails, a data policy, Cedar policies, full transcripts and an audit log. The whole thing is a `Makefile`, a few SQL files, two Connect pipelines and three ADP manifests.
 
 ## The story
