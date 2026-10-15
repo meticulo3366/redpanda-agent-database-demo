@@ -1,0 +1,21 @@
+# Template for adp/agent.yaml. scripts/50-deploy-agent.sh replaces
+# __LLM_PROVIDER__ and __LLM_MODEL__ with LLM_PROVIDER and LLM_MODEL from .env,
+# replaces the __SYSTEM_PROMPT__ line with adp/system-prompt.md indented by six
+# spaces, writes adp/agent.yaml, then runs: rpk ai agent apply -f adp/agent.yaml
+'@type': type.googleapis.com/redpanda.api.adp.v1alpha1.Agent
+name: memory-concierge
+display_name: Memory Concierge
+description: Bank concierge whose long-term memory lives in CockroachDB Cloud and is audited through Redpanda.
+tags:
+  demo: agent-memory
+  owner: zeke.dean
+  stack: cockroachdb-redpanda
+managed:
+  spec:
+    llm_provider: __LLM_PROVIDER__
+    model: __LLM_MODEL__
+    max_iterations: 16
+    mcp_servers:
+      - crdb-agent-memory
+    system_prompt: |
+      __SYSTEM_PROMPT__

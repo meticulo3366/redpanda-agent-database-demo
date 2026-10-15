@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# 00-preflight.sh - check tools and logins, create .env on first run, verify
+# CockroachDB and Redpanda Data Plane API connectivity.
+#
+# Idempotent: an existing .env is never overwritten.
+set -euo pipefail
+# shellcheck source=lib.sh
+source "$(dirname "$0")/lib.sh"
+
+# Fixed values from docs/DESIGN.md sections 2-4.
+FIXED_CRDB_DATABASE="agent_memory"
+FIXED_CRDB_AGENT_USER="agent_rw"
+FIXED_REDPANDA_BROKERS="seed-8a6dfc25.d6kjl4h19241bg3ek3h0.byoc.prd.cloud.redpanda.com:9092"
+FIXED_REDPANDA_DATAPLANE_API="https://api-8a6dfc25.d6kjl4h19241bg3ek3h0.byoc.prd.cloud.redpanda.com"
+FIXED_REDPANDA_SCHEMA_REGISTRY_URL="https://schema-registry-0d1ddabe.d6kjl4h19241bg3ek3h0.byoc.prd.cloud.redpanda.com:30081"
+FIXED_KAFKA_USER="agent-memory-demo"
+FIXED_TOPIC_MEMORY_CDC="agent.memory.cdc"
+FIXED_TOPIC_ACCOUNTS_CDC="agent.accounts.cdc"
+FIXED_ADP_ENV="adp-production"
+FIXED_AIGW_URL="https://aigw.d6kjl4h19241bg3ek3h0.clusters.rdpa.co"
+# The agent runs on the Anthropic provider: for non-Bedrock providers the AI
+# Gateway evaluates the guardrail itself, whereas a guardrail attached to a
+# Bedrock provider never fires on the agent's Converse calls (.env.example).
+FIXED_LLM_PROVIDER="zeke-anthropic-agent-memory"
+FIXED_LLM_MODEL="claude-sonnet-4-6"
+# Bedrock provider: the guardrail's backend and the own-account billing alternative.
+FIXED_BEDROCK_PROVIDER="zeke-bedrock-agent-memory"
+FIXED_BEDROCK_MODEL="us.anthropic.claude-sonnet-4-6"
+FIXED_GUARDRAIL_NAME="agent-memory-guardrail"
+FIXED_MCP_SERVER_NAME="crdb-agent-memory"
+FIXED_AGENT_NAME="memory-concierge"
+FIXED_DEMO_USER_EMAIL="zeke.dean@redpanda.com"
+
+# 32 URL-safe alphanumeric characters (no percent-encoding needed in DSNs/URIs).
+gen_password() {
+  local p
+  p="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 || true)"
+  [[ ${#p} -eq 32 ]] || die "password generation failed"
+  printf '%s' "$p"
+}
+
+# ---------------------------------------------------------------------------
+info "Checking required tools"
+require_cmd rpk psql jq curl
+
+rpk_ver="$(rpk version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
+[[ -n "$rpk_ver" ]] || die "could not determine the rpk version (is rpk on PATH?)"
+rpk_major="${rpk_ver#v}"; rpk_major="${rpk_major%%.*}"
+(( rpk_major >= 26 )) || die "rpk $rpk_ver is too old; this demo needs rpk >= v26 (rpk ai embedded)"
+ok "rpk $rpk_ver"
+ok "psql $(psql --version 2>/dev/null | awk '{print $3}')"
+ok "jq $(jq --version 2>/dev/null)"
+ok "curl $(curl --version 2>/dev/null | head -1 | awk '{print $2}')"
+
+# ---------------------------------------------------------------------------
+info "Checking ADP login (rpk ai auth status)"
+status_json="$(rpk ai auth status -o json 2>/dev/null || true)"
+logged_in="$(jq -r '.logged_in // false' <<<"$status_json" 2>/dev/null || echo false)"
+env_name="$(jq -r '.environment // ""' <<<"$status_json" 2>/dev/null || true)"
+[[ "$logged_in" == "true" ]] || die "rpk ai is not logged in; run: rpk ai auth login"
+[[ "$env_name" == "$FIXED_ADP_ENV" ]] || die "rpk ai environment is '${env_name:-unset}', expected '$FIXED_ADP_ENV'; run: rpk ai env use $FIXED_ADP_ENV"
+ok "logged in as $(jq -r '.user_email // "?"' <<<"$status_json") to $env_name (token expires $(jq -r '.expires_at // "?"' <<<"$status_json"))"
+
+# ---------------------------------------------------------------------------
+if [[ -f "$ENV_FILE" ]]; then
+  info ".env already exists; leaving it untouched ($ENV_FILE)"
+else
+  info "Creating .env from .cockroachlabs.env"
+  crl="$REPO_ROOT/.cockroachlabs.env"
+  [[ -f "$crl" ]] || die "$crl not found. In CockroachDB Cloud open Connect > Connection string, save the generated text as .cockroachlabs.env (gitignored) and re-run."
+
+  raw="$(grep -m1 -E '^[[:space:]]*postgres(ql)?://' "$crl" | tr -d '\r' | sed -E 's/^[[:space:]]+//' || true)"
+  [[ -n "$raw" ]] || die "no postgresql:// connection string found in $crl"
+
+  # Split "postgresql://user:pw@host:port/db?query" into prefix (without db) and query.
+  no_query="${raw%%\?*}"
+  query=""
+  [[ "$raw" == *\?* ]] && query="${raw#*\?}"
+  prefix="${no_query%/*}"                       # postgresql://user:pw@host:port
+  [[ "$prefix" == postgresql://*@* || "$prefix" == postgres://*@* ]] || die "unexpected connection string shape in $crl"
+  hostport="${prefix#*://}"; hostport="${hostport##*@}"
+  [[ "$hostport" == *:* ]] || hostport="$hostport:26257"
+
+  # Rewrite sslmode to require (psql has no ~/.postgresql/root.crt here); keep other params.
+  new_query="sslmode=require"
+  if [[ -n "$query" ]]; then
+    while IFS= read -r kv; do
+      [[ -z "$kv" || "$kv" == sslmode=* ]] && continue
+      new_query="$new_query&$kv"
+    done < <(tr '&' '\n' <<<"$query")
+  fi
+  admin_url="$prefix/$FIXED_CRDB_DATABASE?$new_query"
+
+  pw_db="$(gen_password)"
+  pw_kafka="$(gen_password)"
+
+  old_umask="$(umask)"
+  umask 077
+  tmp="$(mktemp "$REPO_ROOT/.env.XXXXXX")"
+  cat >"$tmp" <<ENVEOF
+# Generated by scripts/00-preflight.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ). Gitignored. Do not commit.
+# See .env.example for documentation of every variable.
+
+# CockroachDB (admin URL copied from .cockroachlabs.env, psql-safe sslmode)
+CRDB_ADMIN_URL="$admin_url"
+CRDB_HOST="$hostport"
+CRDB_DATABASE="$FIXED_CRDB_DATABASE"
+CRDB_AGENT_USER="$FIXED_CRDB_AGENT_USER"
+CRDB_AGENT_PASSWORD="$pw_db"
+
+# Redpanda Cloud
+REDPANDA_BROKERS="$FIXED_REDPANDA_BROKERS"
+REDPANDA_DATAPLANE_API="$FIXED_REDPANDA_DATAPLANE_API"
+REDPANDA_SCHEMA_REGISTRY_URL="$FIXED_REDPANDA_SCHEMA_REGISTRY_URL"
+KAFKA_USER="$FIXED_KAFKA_USER"
+KAFKA_PASSWORD="$pw_kafka"
+TOPIC_MEMORY_CDC="$FIXED_TOPIC_MEMORY_CDC"
+TOPIC_ACCOUNTS_CDC="$FIXED_TOPIC_ACCOUNTS_CDC"
+
+# ADP
+ADP_ENV="$FIXED_ADP_ENV"
+AIGW_URL="$FIXED_AIGW_URL"
+# Provider the agent uses (Anthropic type: the gateway evaluates the guardrail itself)
+LLM_PROVIDER="$FIXED_LLM_PROVIDER"
+LLM_MODEL="$FIXED_LLM_MODEL"
+# Bedrock provider: the guardrail's backend and the own-account billing alternative.
+# Switch with: rpk ai agent update $FIXED_AGENT_NAME --llm-provider "\$BEDROCK_PROVIDER" --model "\$BEDROCK_MODEL"
+BEDROCK_PROVIDER="$FIXED_BEDROCK_PROVIDER"
+BEDROCK_MODEL="$FIXED_BEDROCK_MODEL"
+GUARDRAIL_NAME="$FIXED_GUARDRAIL_NAME"
+MCP_SERVER_NAME="$FIXED_MCP_SERVER_NAME"
+AGENT_NAME="$FIXED_AGENT_NAME"
+DEMO_USER_EMAIL="$FIXED_DEMO_USER_EMAIL"
+ENVEOF
+  mv "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  umask "$old_umask"
+  ok "wrote $ENV_FILE (mode 600; database $FIXED_CRDB_DATABASE on $hostport; generated CRDB_AGENT_PASSWORD and KAFKA_PASSWORD)"
+fi
+
+mkdir -p "$STATE_DIR"
+ok "state directory $STATE_DIR"
+
+load_env
+if ! grep -qE '^BEDROCK_PROVIDER=' "$ENV_FILE"; then
+  log "note: BEDROCK_PROVIDER/BEDROCK_MODEL are not in $ENV_FILE; using the defaults $BEDROCK_PROVIDER / $BEDROCK_MODEL (see .env.example)"
+fi
+ok "agent provider $LLM_PROVIDER ($LLM_MODEL); guardrail backend $BEDROCK_PROVIDER ($BEDROCK_MODEL)"
+
+# ---------------------------------------------------------------------------
+info "Verifying CockroachDB connectivity (SELECT 1 as admin)"
+if ! out="$(crdb_admin_psql "SELECT 1" -At 2>&1)"; then
+  die "cannot connect with CRDB_ADMIN_URL: $out
+Hints: the database '$CRDB_DATABASE' must exist (as admin: CREATE DATABASE $CRDB_DATABASE); if the admin password changed, delete .env and re-run."
+fi
+[[ "$out" == "1" ]] || die "unexpected result from SELECT 1: $out"
+ok "CockroachDB reachable: $CRDB_HOST, database $CRDB_DATABASE"
+
+# ---------------------------------------------------------------------------
+info "Verifying Redpanda Data Plane API (GET /v1/topics?page_size=1)"
+if ! out="$(rp_api GET '/v1/topics?page_size=1')"; then
+  die "Data Plane API call failed: $out"
+fi
+jq -e '.topics' >/dev/null <<<"$out" || die "unexpected Data Plane API response: $out"
+ok "Data Plane API reachable: $REDPANDA_DATAPLANE_API"
+
+if out="$(aigw_rpc GuardrailService/ListGuardrails '{}')" && jq -e '.guardrails' >/dev/null <<<"$out"; then
+  ok "AI Gateway reachable: $AIGW_URL"
+else
+  warn "AI Gateway check failed (GuardrailService/ListGuardrails); scripts/50-deploy-agent.sh needs it"
+fi
+
+info "Preflight complete. Next: make setup-db (or make up for everything)."

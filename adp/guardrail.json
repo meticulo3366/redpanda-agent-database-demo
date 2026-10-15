@@ -1,0 +1,22 @@
+{"guardrail": {
+  "name": "agent-memory-guardrail",
+  "display_name": "Agent memory demo guardrail",
+  "description": "Blocks destructive SQL, blocks investment advice, anonymizes SSNs and card numbers.",
+  "enabled": true,
+  "blocked_input_message": "Blocked by guardrail: this assistant cannot act on that request.",
+  "blocked_output_message": "Blocked by guardrail: the response was withheld by policy.",
+  "bedrock_config": {
+    "backend": {"region": "us-east-2", "llm_provider_ref": "zeke-bedrock-agent-memory"},
+    "word_filter_policy": {"enabled": true, "custom_words": [
+      {"words": ["DROP TABLE", "TRUNCATE TABLE", "DELETE FROM", "ALTER TABLE", "GRANT SELECT", "GRANT INSERT", "REVOKE"],
+       "input": {"action": "GUARDRAIL_ACTION_BLOCK"}, "output": {"action": "GUARDRAIL_ACTION_BLOCK"}}]},
+    "denied_topics_policy": {"enabled": true, "topics": [
+      {"name": "Investment advice",
+       "definition": "Personalised recommendations to buy, sell or move money into specific investments such as stocks, funds or cryptocurrency.",
+       "examples": ["Should I move my savings into crypto?", "Which stocks should I buy?", "Is now a good time to buy bitcoin?"],
+       "input": {"action": "GUARDRAIL_ACTION_BLOCK"}, "output": {"action": "GUARDRAIL_ACTION_BLOCK"}}]},
+    "pii_filter_policy": {"enabled": true, "entities": [
+      {"type": "PII_ENTITY_TYPE_US_SOCIAL_SECURITY_NUMBER", "input": {"action": "PII_ACTION_ANONYMIZE"}, "output": {"action": "PII_ACTION_ANONYMIZE"}},
+      {"type": "PII_ENTITY_TYPE_CREDIT_DEBIT_CARD_NUMBER", "input": {"action": "PII_ACTION_ANONYMIZE"}, "output": {"action": "PII_ACTION_ANONYMIZE"}}]}
+  }
+}}

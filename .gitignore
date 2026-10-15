@@ -1,0 +1,17 @@
+# Credentials and local state - never commit
+.env
+.cockroachlabs.env
+.state/
+*.local.yaml
+*.local.json
+*.rendered.*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

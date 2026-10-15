@@ -1,0 +1,120 @@
+# agent-memory-observer
+#
+# Watches the CockroachDB changefeed on agent.accounts.cdc and turns notable
+# account events into observation memories, so the Memory Concierge remembers
+# what happened to the customer between conversations:
+#   - overdraft      : before.balance >= 0 and after.balance < 0
+#   - large deposit  : after.balance - before.balance >= 5000
+# Everything else (inserts, deletes, resolved markers, other updates) is dropped.
+#
+# Contract: docs/DESIGN.md section 6. Written for Redpanda Connect 4.69.
+#   lint : rpk connect lint --skip-env-var-check connect/account-observer.yaml
+#   test : rpk connect test connect/tests/account-observer_test.yaml
+#
+# In Redpanda Cloud, REDPANDA_BROKERS is a contextual variable and the
+# secrets.NAME interpolations resolve from the cluster secret store (scope
+# SCOPE_REDPANDA_CONNECT). scripts/40-pipelines.sh uploads this file verbatim;
+# with --local it renders a copy that reads plain environment variables
+# (secrets.NAME -> NAME) and moves metrics/logger into the streams-mode root
+# config. Note: the linter interpolates "dollar-brace" even inside comments,
+# so comments here never spell that syntax out.
+
+input:
+  redpanda:
+    seed_brokers: [ "${REDPANDA_BROKERS}" ]
+    tls:
+      enabled: true
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        username: "${secrets.AGENT_MEMORY_KAFKA_USER}"
+        password: "${secrets.AGENT_MEMORY_KAFKA_PASSWORD}"
+    topics: [ "agent.accounts.cdc" ]
+    consumer_group: agent-memory-observer
+    start_offset: earliest
+    commit_period: 1s
+
+pipeline:
+  processors:
+    # One changefeed envelope in, one observation row out (or nothing).
+    # The envelope (verified) is {"after": {...}|null, "before": {...}|null,
+    # "updated": "<hlc>"}; resolved markers are {"resolved": "<hlc>"}.
+    - label: observation_row
+      mapping: |
+        # Only UPDATE events (before and after both present) can be observations.
+        let is_update = !this.exists("resolved") && this.before.type() == "object" && this.after.type() == "object"
+
+        # DECIMAL columns arrive as JSON strings ("2450.00") or numbers depending
+        # on the CockroachDB version: normalise with number().
+        let before_balance = if $is_update { this.before.balance.number() } else { 0 }
+        let after_balance  = if $is_update { this.after.balance.number() } else { 0 }
+        let delta = $after_balance - $before_balance
+
+        let overdraft     = $is_update && $before_balance >= 0 && $after_balance < 0
+        let large_deposit = $is_update && $delta >= 5000
+
+        # Content is one third-person sentence with no PII beyond the nickname.
+        let nickname = this.after.nickname.or("unknown")
+        let currency = this.after.currency.or("USD")
+        # The date comes from after.updated_at (RFC3339 from the changefeed). It is
+        # bound to a variable first because inside catch() the context is the error,
+        # not the message root, so a fallback spelled this.after... would read null.
+        let ts = this.after.updated_at
+        let day = if $is_update {
+          $ts.ts_format("2006-01-02", "UTC").catch($ts.string().slice(0, 10))
+        } else { "" }
+        let movement = "balance moved from %s to %s".format("%.2f".format($before_balance), "%.2f".format($after_balance))
+
+        root = if $overdraft {
+          {
+            "rule": "overdraft",
+            "account_id": this.after.account_id,
+            "subject": this.after.owner_email,
+            "content": "Account '%s' went overdrawn on %s: %s %s.".format($nickname, $day, $movement, $currency),
+            "source_ref": "accounts/%v@%s".format(this.after.account_id, this.updated.string())
+          }
+        } else if $large_deposit {
+          {
+            "rule": "large_deposit",
+            "account_id": this.after.account_id,
+            "subject": this.after.owner_email,
+            "content": "Account '%s' received a large deposit of %s %s on %s: %s.".format($nickname, "%.2f".format($delta), $currency, $day, $movement),
+            "source_ref": "accounts/%v@%s".format(this.after.account_id, this.updated.string())
+          }
+        } else {
+          deleted()
+        }
+    # A malformed event must never poison a batch: log it and drop it.
+    - catch:
+        - log:
+            level: ERROR
+            message: 'agent-memory-observer: dropping malformed changefeed event: ${! error() }'
+        - mapping: root = deleted()
+    # Only surviving observations reach this point (no PII in the log line).
+    - log:
+        level: INFO
+        message: 'agent-memory-observer: ${! this.rule } on account ${! this.account_id } -> observation memory'
+
+output:
+  sql_raw:
+    driver: postgres
+    dsn: "${secrets.AGENT_MEMORY_CRDB_DSN}"
+    query: >-
+      INSERT INTO memories (subject, kind, content, importance, source, source_ref, expires_at)
+      VALUES ($1,'observation',$2,4,'event-stream',$3, now() + INTERVAL '30 days')
+      ON CONFLICT (subject, content_hash) DO NOTHING
+    # The row object is produced (and unit tested) by the observation_row
+    # processor above; this mapping only reads its fields in placeholder order.
+    args_mapping: |
+      root = [ this.subject, this.content, this.source_ref ]
+    max_in_flight: 2
+    batching:
+      count: 100
+      period: 1s
+
+# Service-wide fields (stripped by scripts/40-pipelines.sh --local, where they
+# move into the streams-mode root config).
+metrics:
+  prometheus: {}
+
+logger:
+  level: INFO
