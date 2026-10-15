@@ -15,3 +15,6 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Prospect-specific material (names customers): never commit to this public repo
+prospects/
