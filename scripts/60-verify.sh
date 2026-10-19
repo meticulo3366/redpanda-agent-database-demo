@@ -266,12 +266,16 @@ else
   fi
 
   info "Memory round-trip (store in one conversation, recall in a new one)"
-  nonce="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 8 || true)"
-  token="verify-${nonce:-$$}"
-  # A harmless fact: the system prompt (correctly) refuses to store anything that looks like a
-  # secret, token or password, so the nonce is embedded in a coffee shop name instead.
+  # A harmless, natural-looking fact. The system prompt (correctly) refuses to store anything
+  # that looks like a secret, token or password, and it treats token-like strings such as
+  # "verify-dk73fokh" as suspicious data it will not repeat, so the nonce is a pronounceable
+  # pseudo-word (four random syllables, title case) used as a coffee shop name.
+  syllables=(ma ro bel ta ni vo lu ke sa do ri fen po la tu mi)
+  nonce=""
+  for _ in 1 2 3 4; do nonce+="${syllables[$((RANDOM % ${#syllables[@]}))]}"; done
+  token="$(printf '%s' "${nonce:0:1}" | tr '[:lower:]' '[:upper:]')${nonce:1}"
   store_msg="Please remember this about me: my favourite coffee shop is called ${token} Coffee."
-  recall_msg="What is the name of my favourite coffee shop? If you remember it, answer with just the name."
+  recall_msg="What is the name of my favourite coffee shop? Answer with the shop's name exactly as you have it stored."
   ctx1=""; ctx2=""
   if j1="$(a2a_send_json "$store_msg")"; then
     ctx1="$(a2a_ctx "$j1")"
